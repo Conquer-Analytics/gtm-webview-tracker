@@ -19,7 +19,7 @@ selector**. Create one variable instance per field you want:
 | `is_inapp` | boolean | `true` | custom dimension `webview` |
 | `app_name` | string | `facebook`, `instagram`, `tiktok` (generic bucket like `android_webview` if unidentified) | custom dimension `traffic_env` (prefix to taste, e.g. `inapp_facebook`) |
 | `token` | string | `FBIOS`, `FB4A`, `BytedanceWebview`, `wv` | custom dimension `traffic_token` — granular signal, good for spotting unknown variants |
-| `ua_tail` | string | `[FBAN/FBIOS;…]` (in-app), or the last 100 chars of the UA (everything else) | event param `ua_tail` — a ≤100-char, GA4-safe slice of the UA. Send it as a plain event parameter for the BigQuery export; *not* a custom dimension (truncation + high-cardinality — [see below](#using-with-bigquery-recommended)). GA4 doesn't collect the UA otherwise |
+| `ua_tail` | string | `[FBAN/FBIOS;…]` (in-app), `Version/17.5` / `CriOS/126.0…` (regular iOS web), or the last 100 chars of the UA (no landmark found) | event param `ua_tail` — a ≤100-char, GA4-safe slice of the UA. Send it as a plain event parameter for the BigQuery export; *not* a custom dimension (truncation + high-cardinality — [see below](#using-with-bigquery-recommended)). GA4 doesn't collect the UA otherwise |
 | `all` | object | `{raw_ua, ua_tail, is_inapp, app_name, token}` | advanced: feed another Custom JS variable (this is the only output carrying the **full, untruncated** UA — route it to a non-GA4 sink if you need it) |
 
 Not an in-app browser → `is_inapp` is `false` and `app_name` / `token` are
@@ -85,11 +85,21 @@ The token list is cross-checked against [**inapp-spy**](https://github.com/shala
 - **High confidence — matches inapp-spy:** `facebook`, `messenger`, `instagram`,
   `threads` (codename *Barcelona*), `tiktok` (`musical_ly`/`Bytedance`),
   `snapchat`, `linkedin`, `wechat` (`MicroMessenger`), `line`, `twitter`,
-  `googleapp` (`GSA`), `whatsapp` (`WAiOS`/`WA4A`).
-- **Beyond the curated list — verify before trusting:** `pinterest`, `reddit`,
+  `googleapp` (`GSA`), `whatsapp` (`WAiOS`/`WA4A`), `reddit`.
+- **Beyond the curated list — verify before trusting:** `pinterest`,
   `kakaotalk`, `telegram` (upstream detects Telegram *client-side*, not by UA),
   and TikTok's `Trill`/`aweme` aliases. Plausible and seen in the wild, but not
   in inapp-spy — treat as best-effort.
+
+**Matching is case-insensitive**, mirroring inapp-spy, where every pattern
+carries the `/i` flag. Rows that mirror an upstream pattern keep its trailing
+slash (`reddit/`, `micromessenger/`, `line/`) — that slash is what separates the
+app from its own crawler (`Reddit/2024.1` matches, `Redditbot/1.0` does not).
+
+**Crawlers are filtered out first.** Link-preview fetchers carry app names too
+(`Twitterbot/1.0`, `TelegramBot (like TwitterBot)`, `Pinterest/0.2 (+http://…)`)
+and would otherwise land in your in-app numbers. GTM needs JS execution so most
+never arrive, but JS-rendering preview services do exist.
 
 **Generic detection (catches everything else).** These set `is_inapp = true`
 with a **generic `app_name` bucket** — the specific app is unknown. The
@@ -99,11 +109,15 @@ detection method is also recorded in `token`:
   reliable Android System WebView flag.
 - **`webview`** (token `WebView`) — any UA carrying the literal `WebView` token
   (inapp-spy's generic catch).
-- **`ios_webview`** (token `no-safari-token`) — iOS WKWebView heuristic: an iOS
-  WebKit UA missing the `Safari` token that real Mobile Safari always carries.
-  **Imperfect** — an unknown iOS app that appends no vendor token is
-  indistinguishable from Safari, so expect iOS false negatives on unknown apps.
-  Known apps (FB/IG/etc.) are still caught by their tokens regardless.
+- **`ios_webview`** (token `no-safari-token`) — iOS WKWebView heuristic,
+  aligned with inapp-spy's `(iPhone|iPod|iPad)(?!.*Safari/)`: an Apple mobile UA
+  missing the `Safari/` token that real Mobile Safari always carries. It
+  deliberately does *not* also demand `AppleWebKit` or a `Mobile/` build token —
+  requiring those made this stricter than upstream and missed in-app browsers
+  shipping neither. **Still imperfect** — an unknown iOS app that appends no
+  vendor token *and* keeps the Safari token is indistinguishable from Safari, so
+  expect iOS false negatives on unknown apps. Known apps (FB/IG/etc.) are still
+  caught by their tokens regardless.
 
 ### The discovery loop
 
@@ -124,9 +138,21 @@ output does the isolation **in GTM**: apps *append* their tokens after the
 standard browser UA, so it keeps only the **tail** after the last standard
 landmark — `Mobile/<build>` on iOS, `Safari/<version>` on Android. That residual
 is exactly where unmapped tokens live (`[FBAN/…]`, `Instagram 333…`,
-`BytedanceWebview/… musical_ly_…`). Browsers with no appended block (desktop,
-regular mobile web) fall back to the last 100 chars of the UA, so the field is
-still populated for non-in-app traffic. In BigQuery you then `GROUP BY ua_tail`
+`BytedanceWebview/… musical_ly_…`).
+
+**Capping direction differs per path, and it matters.** An isolated vendor block
+carries its app name at the *front* (`Instagram 336.0.0…`, `[FBAN/FBIOS;…`), so
+it is capped **head-first** — capping it tail-first would cut off exactly the
+token you are hunting on the longest blocks, which is Instagram and Messenger.
+Only the fallback keeps the **last** 100 chars, because there the rightmost end
+is the highest-signal one.
+
+**Some iOS apps put their token *before* the landmark** (`GSA/…`, `CriOS/…`,
+`FxiOS/…`, i.e. `<vendor> Mobile/<build> Safari/<version>`). When nothing follows
+the landmark at all, the token directly in front of it is returned instead, so
+those UAs stay visible in the tail scan rather than collapsing to a useless
+`Safari/604.1`. Browsers with no landmark at all (desktop) fall back to the last
+100 chars of the UA, so the field is still populated for non-in-app traffic. In BigQuery you then `GROUP BY ua_tail`
 directly — the tail is already isolated, no extraction step needed.
 
 > **Why trim to a landmark rather than parse the whole UA?** A *full* "remove all
@@ -200,8 +226,10 @@ CSV, dbt-style — see [Relationship to the warehouse approach](#relationship-to
 Detection lives in one ordered table (`APPS`) in the sandboxed JS — first match
 wins, so list specific markers before generic ones. To support a new app:
 
-1. Add a row: `{ match: '<UA substring>', app: '<name>', token: '<token>' }`
-   (or `extract: '<key>/'` to pull a value out of the UA, like Meta's codes).
+1. Add a row: `{ match: '<ua substring, lowercase>', app: '<name>', token: '<token>' }`
+   (or `extract: '<key>/'`, also lowercase, to pull a value out of the UA, like
+   Meta's codes). The `match` and `extract` values **must be lowercase** — they
+   are compared against a lowercased UA.
 2. Add a test scenario mirroring the real UA.
 3. Re-import the updated `template.tpl` into GTM.
 
@@ -218,6 +246,11 @@ before publishing.
   passed into the field. This also means the template requests **zero**
   permissions.
 - Matching is plain `indexOf` substring search: **sandboxed JS has no `RegExp`**.
+  It runs against a lowercased copy of the UA (upstream is case-insensitive
+  throughout), while `extract` reads its value from the *original* string so
+  tokens keep their real casing (`FBIOS`, not `fbios`). That relies on
+  `toLowerCase()` being length-preserving, which holds for the ASCII a UA is
+  built from.
 - Meta tokens (`FBAN/`, `FB_IAB/`) are the most durable signal — because apps
   build their own full UA, these are **not** subject to Chrome's UA Client Hints
   reduction that's freezing the normal browser/OS portion.
